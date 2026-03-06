@@ -45,6 +45,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -370,6 +371,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    hidden_states_dict: "dict[str, np.ndarray] | None"
 
 
 class GPUModelRunner(
@@ -756,6 +758,8 @@ class GPUModelRunner(
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
+        # Per-request flag: does this request want per-layer hidden states?
+        self.req_return_hidden_states: dict[str, bool] = {}
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
 
@@ -944,6 +948,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.req_return_hidden_states.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -1024,6 +1029,12 @@ class GPUModelRunner(
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+
+            if (
+                sampling_params
+                and sampling_params.return_hidden_states
+            ):
+                self.req_return_hidden_states[req_id] = True
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -3576,6 +3587,31 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
+        # Determine which requests complete their prefill in this step and have
+        # requested per-layer hidden state capture. Maps req_id → flat token
+        # index of the last prefill token within the current batch.
+        requests_completing_prefill: dict[str, int] = {}
+        if self.req_return_hidden_states:
+            # Cumulative token offsets: token_offsets[i] is the index in the
+            # flat batch tensor where request i's tokens begin.
+            token_offsets = np.concatenate(
+                [[0], np.cumsum(num_scheduled_tokens_np)]
+            )
+            for batch_idx, req_id in enumerate(req_ids):
+                if not self.req_return_hidden_states.get(req_id, False):
+                    continue
+                req_state = self.requests[req_id]
+                num_computed = req_state.num_computed_tokens
+                prefill_len = len(req_state.prompt_token_ids)
+                num_sched = int(num_scheduled_tokens_np[batch_idx])
+                if (
+                    num_computed < prefill_len
+                    and num_computed + num_sched >= prefill_len
+                ):
+                    tokens_needed = prefill_len - num_computed
+                    last_token_idx = int(token_offsets[batch_idx]) + tokens_needed - 1
+                    requests_completing_prefill[req_id] = last_token_idx
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -3614,6 +3650,8 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if requests_completing_prefill:
+                get_forward_context().capture_hidden_states = True
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -3621,6 +3659,23 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            # Extract per-layer hidden states for requests completing prefill,
+            # while still inside the forward context where captured_layer_outputs
+            # is valid.
+            hidden_states_dict: dict[str, np.ndarray] | None = None
+            if requests_completing_prefill:
+                layer_outputs = get_forward_context().captured_layer_outputs
+                if layer_outputs:
+                    hidden_states_dict = {}
+                    for req_id, last_token_idx in (
+                        requests_completing_prefill.items()
+                    ):
+                        per_layer = torch.stack(
+                            [lo[last_token_idx] for lo in layer_outputs], dim=0
+                        )  # [num_layers, hidden_size]
+                        hidden_states_dict[req_id] = (
+                            per_layer.to(torch.float16).cpu().numpy()
+                        )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3692,6 +3747,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            hidden_states_dict,
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -3730,6 +3786,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            hidden_states_dict,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -3877,6 +3934,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                hidden_states_dict=hidden_states_dict,
             )
 
         if not self.use_async_scheduling:
