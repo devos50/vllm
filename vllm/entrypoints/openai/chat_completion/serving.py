@@ -1711,6 +1711,16 @@ class OpenAIServingChat(OpenAIServing):
 
         request_metadata.final_usage_info = usage
 
+        # Serialize per-layer hidden states as base64-encoded float16 arrays.
+        encoded_hidden_states: list[str] | None = None
+        if final_res.hidden_states is not None:
+            import base64
+            hs = final_res.hidden_states  # [num_layers, hidden_size] float16
+            encoded_hidden_states = [
+                base64.b64encode(hs[i].astype("float16").tobytes()).decode("ascii")
+                for i in range(hs.shape[0])
+            ]
+
         response = ChatCompletionResponse(
             id=request_id,
             created=created_time,
@@ -1722,6 +1732,7 @@ class OpenAIServingChat(OpenAIServing):
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
             kv_transfer_params=final_res.kv_transfer_params,
+            hidden_states=encoded_hidden_states,
         )
 
         # Log complete response if output logging is enabled

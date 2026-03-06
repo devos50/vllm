@@ -1147,12 +1147,24 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        fwd_ctx = get_forward_context()
+        if fwd_ctx.capture_hidden_states:
+            fwd_ctx.captured_layer_outputs = []
+
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
             )
+            if fwd_ctx.capture_hidden_states:
+                # Capture post-residual hidden state (input to next layer's norm).
+                # residual may be None on the very first layer before fused norms
+                # accumulate it, but after the first layer it is a proper tensor.
+                assert fwd_ctx.captured_layer_outputs is not None
+                fwd_ctx.captured_layer_outputs.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

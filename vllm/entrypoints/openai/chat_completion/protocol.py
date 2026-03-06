@@ -110,6 +110,11 @@ class ChatCompletionResponse(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
+    # Per-layer hidden states captured at prefill completion.
+    # A list of base64-encoded float16 numpy arrays, one per transformer layer.
+    # Each decodes to shape [hidden_size]. Only present when
+    # return_hidden_states=true in the request.
+    hidden_states: list[str] | None = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -312,6 +317,18 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    return_hidden_states: bool | None = Field(
+        default=None,
+        description=(
+            "If true, the response will include per-layer hidden states captured "
+            "at the end of the prefill phase (i.e., after all prompt tokens have "
+            "been processed). The hidden states are returned as a list of "
+            "base64-encoded float16 numpy arrays in the 'hidden_states' field of "
+            "the response, one entry per transformer layer. Each array has shape "
+            "[hidden_size]. Only supported for non-streaming requests."
+        ),
+    )
+
     cache_salt: str | None = Field(
         default=None,
         description=(
@@ -511,6 +528,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
+            return_hidden_states=bool(self.return_hidden_states),
         )
 
     @model_validator(mode="before")

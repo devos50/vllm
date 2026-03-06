@@ -240,6 +240,12 @@ class ForwardContext:
 
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
+    # Hidden-state capture fields. Set capture_hidden_states=True before a
+    # forward pass to make the model populate captured_layer_outputs with one
+    # tensor per decoder layer (shape [num_tokens, hidden_size]).
+    capture_hidden_states: bool = False
+    captured_layer_outputs: list["torch.Tensor"] | None = None
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.is_valid_runtime_mode(), (
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"

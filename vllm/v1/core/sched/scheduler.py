@@ -1287,6 +1287,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        hidden_states_dict = model_runner_output.hidden_states_dict
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1445,6 +1446,11 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        hidden_states=(
+                            hidden_states_dict.get(req_id)
+                            if hidden_states_dict
+                            else None
+                        ),
                     )
                 )
             else:

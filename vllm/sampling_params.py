@@ -283,6 +283,11 @@ class SamplingParams(
 
     skip_reading_prefix_cache: bool | None = None
 
+    return_hidden_states: bool = False
+    """If True, capture and return the per-layer hidden states of the final
+    prefill token. The hidden states are returned as a list of base64-encoded
+    float16 numpy arrays (one per transformer layer) via the API response."""
+
     repetition_detection: RepetitionDetectionParams | None = None
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
@@ -321,6 +326,7 @@ class SamplingParams(
         extra_args: dict[str, Any] | None = None,
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
+        return_hidden_states: bool = False,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -361,6 +367,7 @@ class SamplingParams(
             extra_args=extra_args,
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
+            return_hidden_states=return_hidden_states,
         )
 
     def __post_init__(self) -> None:

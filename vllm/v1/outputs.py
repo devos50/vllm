@@ -247,6 +247,11 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # Per-layer hidden states captured at prefill completion for requests that
+    # set return_hidden_states=True. Maps req_id -> numpy array of shape
+    # [num_layers, hidden_size] (float16).
+    hidden_states_dict: dict[str, np.ndarray] | None = None
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

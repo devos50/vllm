@@ -33,7 +33,7 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     prepare_communication_buffer_for_model,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -190,6 +190,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_speculative_tokens=self.num_speculative_steps + 1,
         )
         self.prompt_logprobs_worker = PromptLogprobsWorker(self.max_num_reqs)
+
+        # Per-request flag: does this request want per-layer hidden states?
+        self.req_return_hidden_states: dict[str, bool] = {}
 
         # CUDA graphs.
         self.cudagraph_manager = CudaGraphManager(
@@ -538,6 +541,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_cache.remove_request(req_id)
             self.prompt_logprobs_worker.remove_request(req_id)
             self.lora_state.remove_request(req_id)
+            self.req_return_hidden_states.pop(req_id, None)
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.encoder_cache is not None:
@@ -574,6 +578,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.prompt_logprobs_worker.add_request(
                     req_id, req_index, new_req_data.sampling_params
                 )
+                if new_req_data.sampling_params.return_hidden_states:
+                    self.req_return_hidden_states[req_id] = True
 
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
@@ -946,7 +952,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             model_inputs["inputs_embeds"] = None
             model_inputs["intermediate_tensors"] = intermediate_tensors
 
+        # Determine which requests will complete their prefill in this step
+        # and have requested per-layer hidden state capture.
+        # Maps req_id → flat-batch index of the last prefill token.
+        requests_completing_prefill: dict[str, int] = {}
+        if self.req_return_hidden_states and not dummy_run:
+            for batch_idx, req_id in enumerate(input_batch.req_ids):
+                if not self.req_return_hidden_states.get(req_id, False):
+                    continue
+                req_state_idx = int(input_batch.idx_mapping_np[batch_idx])
+                num_computed_prefill = int(
+                    self.req_states.num_computed_prefill_tokens[req_state_idx]
+                )
+                prefill_len = int(self.req_states.prefill_len.np[req_state_idx])
+                num_sched = int(input_batch.num_scheduled_tokens[batch_idx])
+                if (
+                    num_computed_prefill < prefill_len
+                    and num_computed_prefill + num_sched >= prefill_len
+                ):
+                    # Last token of the final prefill chunk is the last scheduled
+                    # token for this request in the flat batch tensor.
+                    last_token_idx = (
+                        int(input_batch.query_start_loc_np[batch_idx + 1]) - 1
+                    )
+                    requests_completing_prefill[req_id] = last_token_idx
+
         # Run model.
+        hidden_states_dict: dict[str, np.ndarray] | None = None
         if cudagraph_runtime_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -976,6 +1008,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mappings_by_layer,
             ):
+                if requests_completing_prefill:
+                    get_forward_context().capture_hidden_states = True
                 self.kv_connector.pre_forward(scheduler_output)
                 model_output = self.model(**model_inputs)
                 if self.use_aux_hidden_state_outputs:
@@ -983,6 +1017,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     hidden_states = model_output
                     aux_hidden_states = None
+
+                # Extract per-layer hidden states for requests completing prefill.
+                if requests_completing_prefill:
+                    layer_outputs = get_forward_context().captured_layer_outputs
+                    if layer_outputs:
+                        hidden_states_dict = {}
+                        for req_id, last_token_idx in (
+                            requests_completing_prefill.items()
+                        ):
+                            per_layer = torch.stack(
+                                [lo[last_token_idx] for lo in layer_outputs],
+                                dim=0,
+                            )  # [num_layers, hidden_size]
+                            hidden_states_dict[req_id] = (
+                                per_layer.to(torch.float16).cpu().numpy()
+                            )
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
         self.execute_model_state = (
@@ -994,6 +1044,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states,
             kv_connector_output,
             num_tokens_across_dp,
+            hidden_states_dict,
         )
 
         if not self.is_last_pp_rank:
@@ -1021,6 +1072,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states,
             kv_connector_output,
             num_tokens_across_dp,
+            hidden_states_dict,
         ) = self.execute_model_state
         self.execute_model_state = None
 
@@ -1063,6 +1115,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
             kv_connector_output=kv_connector_output,
+            hidden_states_dict=hidden_states_dict,
         )
         async_output = AsyncOutput(
             model_runner_output=model_runner_output,
@@ -1112,7 +1165,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The prior execute_model call must have failed.
             return None
 
-        input_batch, _, _, _, hidden_states, _, kv_connector_output, _ = (
+        input_batch, _, _, _, hidden_states, _, kv_connector_output, _, _ = (
             self.execute_model_state
         )
         self.execute_model_state = None

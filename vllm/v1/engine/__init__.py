@@ -177,6 +177,9 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+    # Per-layer hidden states at prefill completion. Shape [num_layers,
+    # hidden_size], dtype float16. Only set when return_hidden_states=True.
+    hidden_states: np.ndarray | None = None
 
     @property
     def finished(self) -> bool:
