@@ -185,6 +185,10 @@ class RequestState:
             deque() if stream_input else None
         )
 
+        # Cached hidden states: populated at prefill completion (which may arrive
+        # before the request finishes) and carried forward to the final output.
+        self._cached_hidden_states: np.ndarray | None = None
+
     def apply_streaming_update(self, update: StreamingUpdate) -> None:
         # Apply the update to the request state.
         self.streaming_input = not update.final
@@ -279,6 +283,12 @@ class RequestState:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
+        # Cache hidden states when they arrive (prefill-completing step). They
+        # may arrive before the request finishes, so we must persist them here
+        # rather than relying on a non-None value when the final output is built.
+        if hidden_states is not None:
+            self._cached_hidden_states = hidden_states
+
         if not finished and final_only:
             # Only the final output is required in FINAL_ONLY mode.
             return None
@@ -328,7 +338,8 @@ class RequestState:
             external_req_id = self.parent_req.external_req_id
 
         return self._new_request_output(
-            external_req_id, outputs, finished, kv_transfer_params, hidden_states
+            external_req_id, outputs, finished, kv_transfer_params,
+            self._cached_hidden_states,
         )
 
     def _new_request_output(
